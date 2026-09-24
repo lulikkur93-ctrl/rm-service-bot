@@ -1,37 +1,53 @@
-
-import os
+import asyncio
 import logging
+import os
+
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+# ---------- настройки (Railway -> Variables) ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "487674664"))
+ADMIN_ID = int(os.environ["ADMIN_ID"])  # ваш числовой Telegram ID
+CHANNEL_URL = "https://t.me/RMservice99"
+# Ник менеджера без @, например: MANAGER_USERNAME=ivan_rm
+# Если не задан, кнопки ведут в канал.
+_manager = os.getenv("MANAGER_USERNAME", "").lstrip("@")
+MANAGER_URL = f"https://t.me/{_manager}" if _manager else CHANNEL_URL
 
 logging.basicConfig(level=logging.INFO)
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+CONSENT = "Отправляя номер и фото, вы соглашаетесь на обработку этих данных для связи по заявке."
+
 
 class SellForm(StatesGroup):
     manufacturer = State()
     model = State()
     condition = State()
-    комплект = State()
+    kit = State()
     photos = State()
     phone = State()
+
 
 class RepairForm(StatesGroup):
     problem = State()
     model = State()
     photos = State()
     phone = State()
+
 
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -43,10 +59,18 @@ def main_menu():
         [InlineKeyboardButton(text="👨‍💻 Связаться с менеджером", callback_data="manager")],
     ])
 
-def back_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")]
-    ])
+
+def home_button():
+    return [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")]
+
+
+def contact_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📲 Отправить номер", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
 
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
@@ -55,18 +79,21 @@ async def start(message: Message, state: FSMContext):
         "<b>👋 Добро пожаловать в RM Service!</b>\n\n"
         "Ремонт, скупка и продажа телефонов в Москве.\n"
         "Выберите нужную услугу 👇",
-        reply_markup=main_menu()
+        reply_markup=main_menu(),
     )
+
 
 @dp.callback_query(F.data == "home")
 async def home(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text(
         "<b>🏠 RM Service</b>\n\nВыберите нужную услугу 👇",
-        reply_markup=main_menu()
+        reply_markup=main_menu(),
     )
     await call.answer()
 
+
+# ---------- скупка ----------
 @dp.callback_query(F.data == "sell")
 async def sell_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(SellForm.manufacturer)
@@ -77,9 +104,11 @@ async def sell_start(call: CallbackQuery, state: FSMContext):
          InlineKeyboardButton(text="📱 Honor", callback_data="man_Honor")],
         [InlineKeyboardButton(text="📱 Huawei", callback_data="man_Huawei"),
          InlineKeyboardButton(text="📱 Другое", callback_data="man_Другое")],
+        home_button(),
     ])
     await call.message.edit_text("📱 <b>Продажа телефона</b>\n\nВыберите производителя:", reply_markup=kb)
     await call.answer()
+
 
 @dp.callback_query(SellForm.manufacturer, F.data.startswith("man_"))
 async def sell_man(call: CallbackQuery, state: FSMContext):
@@ -88,7 +117,8 @@ async def sell_man(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("✍️ Напишите модель и объём памяти.\n\nНапример: <b>iPhone 15 Pro 256 GB</b>")
     await call.answer()
 
-@dp.message(SellForm.model)
+
+@dp.message(SellForm.model, F.text)
 async def sell_model(message: Message, state: FSMContext):
     await state.update_data(model=message.text)
     await state.set_state(SellForm.condition)
@@ -101,10 +131,11 @@ async def sell_model(message: Message, state: FSMContext):
     ])
     await message.answer("📊 В каком состоянии телефон?", reply_markup=kb)
 
+
 @dp.callback_query(SellForm.condition, F.data.startswith("c_"))
 async def sell_condition(call: CallbackQuery, state: FSMContext):
     await state.update_data(condition=call.data[2:])
-    await state.set_state(SellForm.комплект)
+    await state.set_state(SellForm.kit)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Полный комплект", callback_data="set_Полный комплект")],
         [InlineKeyboardButton(text="🔌 Телефон + кабель", callback_data="set_Телефон + кабель")],
@@ -113,9 +144,10 @@ async def sell_condition(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("📦 Что есть в комплекте?", reply_markup=kb)
     await call.answer()
 
-@dp.callback_query(SellForm.комплект, F.data.startswith("set_"))
+
+@dp.callback_query(SellForm.kit, F.data.startswith("set_"))
 async def sell_set(call: CallbackQuery, state: FSMContext):
-    await state.update_data(комплект=call.data[4:])
+    await state.update_data(kit=call.data[4:])
     await state.set_state(SellForm.photos)
     await call.message.edit_text(
         "📸 Пришлите 2–4 фотографии телефона.\n\n"
@@ -124,42 +156,45 @@ async def sell_set(call: CallbackQuery, state: FSMContext):
     )
     await call.answer()
 
+
 @dp.message(SellForm.photos)
 async def sell_photos(message: Message, state: FSMContext):
     data = await state.get_data()
-    if message.text and message.text.lower() == "готово":
+    if message.text and message.text.strip().lower() == "готово":
         await state.set_state(SellForm.phone)
-        kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="📲 Отправить номер", request_contact=True)]],
-            resize_keyboard=True, one_time_keyboard=True
+        await message.answer(
+            "📞 Оставьте номер телефона для связи с менеджером.\n\n" + CONSENT,
+            reply_markup=contact_keyboard(),
         )
-        await message.answer("📞 Оставьте номер телефона для связи с менеджером.", reply_markup=kb)
         return
     photos = data.get("photos", [])
     if message.photo:
         photos.append(message.photo[-1].file_id)
         await state.update_data(photos=photos)
-        await message.answer(f"📸 Фото получено ({len(photos)}). Отправьте ещё или нажмите/напишите <b>Готово</b>.")
+        await message.answer(f"📸 Фото получено ({len(photos)}). Отправьте ещё или напишите <b>Готово</b>.")
     else:
         await message.answer("Пришлите фотографию или напишите <b>Готово</b>.")
+
 
 @dp.message(SellForm.phone, F.contact)
 async def sell_phone(message: Message, state: FSMContext):
     await finish_sell(message, state, message.contact.phone_number)
 
-@dp.message(SellForm.phone)
+
+@dp.message(SellForm.phone, F.text)
 async def sell_phone_text(message: Message, state: FSMContext):
     await finish_sell(message, state, message.text)
+
 
 async def finish_sell(message: Message, state: FSMContext, phone: str):
     data = await state.get_data()
     username = f"@{message.from_user.username}" if message.from_user.username else "не указан"
     text = (
         "🔔 <b>НОВАЯ ЗАЯВКА — СКУПКА</b>\n\n"
-        f"📱 Производитель: {data.get('manufacturer','—')}\n"
-        f"📱 Модель: {data.get('model','—')}\n"
-        f"📊 Состояние: {data.get('condition','—')}\n"
-        f"📦 Комплект: {data.get('комплект','—')}\n"
+        f"📱 Производитель: {data.get('manufacturer', '—')}\n"
+        f"📱 Модель: {data.get('model', '—')}\n"
+        f"📊 Состояние: {data.get('condition', '—')}\n"
+        f"📦 Комплект: {data.get('kit', '—')}\n"
         f"📞 Телефон: {phone}\n"
         f"👤 Telegram: {username}"
     )
@@ -169,9 +204,11 @@ async def finish_sell(message: Message, state: FSMContext, phone: str):
     await state.clear()
     await message.answer(
         "✅ <b>Заявка принята!</b>\n\nМенеджер RM Service свяжется с вами для уточнения деталей и оценки телефона.",
-        reply_markup=main_menu()
+        reply_markup=main_menu(),
     )
 
+
+# ---------- ремонт ----------
 @dp.callback_query(F.data == "repair")
 async def repair_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(RepairForm.problem)
@@ -184,9 +221,11 @@ async def repair_start(call: CallbackQuery, state: FSMContext):
          InlineKeyboardButton(text="🔊 Нет звука", callback_data="p_Нет звука")],
         [InlineKeyboardButton(text="🔌 Не заряжается", callback_data="p_Не заряжается")],
         [InlineKeyboardButton(text="❓ Другая проблема", callback_data="p_Другая проблема")],
+        home_button(),
     ])
     await call.message.edit_text("🔧 <b>Ремонт телефона</b>\n\nЧто случилось с телефоном?", reply_markup=kb)
     await call.answer()
+
 
 @dp.callback_query(RepairForm.problem, F.data.startswith("p_"))
 async def repair_problem(call: CallbackQuery, state: FSMContext):
@@ -195,22 +234,23 @@ async def repair_problem(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("✍️ Напишите модель телефона.\n\nНапример: <b>iPhone 14 Pro</b>")
     await call.answer()
 
-@dp.message(RepairForm.model)
+
+@dp.message(RepairForm.model, F.text)
 async def repair_model(message: Message, state: FSMContext):
     await state.update_data(model=message.text)
     await state.set_state(RepairForm.photos)
     await message.answer("📸 Если можете, пришлите фото повреждения. Затем напишите <b>Готово</b>.")
 
+
 @dp.message(RepairForm.photos)
 async def repair_photos(message: Message, state: FSMContext):
     data = await state.get_data()
-    if message.text and message.text.lower() == "готово":
+    if message.text and message.text.strip().lower() == "готово":
         await state.set_state(RepairForm.phone)
-        kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="📲 Отправить номер", request_contact=True)]],
-            resize_keyboard=True, one_time_keyboard=True
+        await message.answer(
+            "📞 Оставьте номер телефона для связи с мастером.\n\n" + CONSENT,
+            reply_markup=contact_keyboard(),
         )
-        await message.answer("📞 Оставьте номер телефона для связи с мастером.", reply_markup=kb)
         return
     photos = data.get("photos", [])
     if message.photo:
@@ -220,21 +260,24 @@ async def repair_photos(message: Message, state: FSMContext):
     else:
         await message.answer("Пришлите фото или напишите <b>Готово</b>.")
 
+
 @dp.message(RepairForm.phone, F.contact)
 async def repair_phone(message: Message, state: FSMContext):
     await finish_repair(message, state, message.contact.phone_number)
 
-@dp.message(RepairForm.phone)
+
+@dp.message(RepairForm.phone, F.text)
 async def repair_phone_text(message: Message, state: FSMContext):
     await finish_repair(message, state, message.text)
+
 
 async def finish_repair(message: Message, state: FSMContext, phone: str):
     data = await state.get_data()
     username = f"@{message.from_user.username}" if message.from_user.username else "не указан"
     text = (
         "🔔 <b>НОВАЯ ЗАЯВКА — РЕМОНТ</b>\n\n"
-        f"📱 Модель: {data.get('model','—')}\n"
-        f"🔧 Проблема: {data.get('problem','—')}\n"
+        f"📱 Модель: {data.get('model', '—')}\n"
+        f"🔧 Проблема: {data.get('problem', '—')}\n"
         f"📞 Телефон: {phone}\n"
         f"👤 Telegram: {username}"
     )
@@ -244,32 +287,37 @@ async def finish_repair(message: Message, state: FSMContext, phone: str):
     await state.clear()
     await message.answer(
         "✅ <b>Заявка на ремонт принята!</b>\n\nМастер свяжется с вами для уточнения неисправности и стоимости.",
-        reply_markup=main_menu()
+        reply_markup=main_menu(),
     )
 
+
+# ---------- информация ----------
 @dp.callback_query(F.data == "estimate")
 async def estimate(call: CallbackQuery):
     await call.message.edit_text(
         "💰 <b>Узнать стоимость</b>\n\n"
-        "Для предварительной оценки нажмите «Продать телефон» — бот соберёт модель, состояние, комплект и фотографии.",
+        "Для предварительной оценки нажмите «Продать телефон»: бот соберёт модель, состояние, комплект и фотографии.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📱 Заполнить заявку", callback_data="sell")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")]
-        ])
+            home_button(),
+        ]),
     )
     await call.answer()
+
 
 @dp.callback_query(F.data == "buy")
 async def buy(call: CallbackQuery):
     await call.message.edit_text(
         "🛒 <b>Купить телефон</b>\n\n"
-        "Актуальный ассортимент и цены уточняйте у менеджера RM Service.",
+        "Актуальные цены и наличие смотрите в нашем канале или уточняйте у менеджера.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👨‍💻 Написать менеджеру", url="https://t.me/RMservice99")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")]
-        ])
+            [InlineKeyboardButton(text="📢 Цены в канале", url=CHANNEL_URL)],
+            [InlineKeyboardButton(text="👨‍💻 Написать менеджеру", url=MANAGER_URL)],
+            home_button(),
+        ]),
     )
     await call.answer()
+
 
 @dp.callback_query(F.data == "contacts")
 async def contacts(call: CallbackQuery):
@@ -279,29 +327,31 @@ async def contacts(call: CallbackQuery):
         "ул. Дмитриевского, 23\n\n"
         "📞 8 (977) 606-77-50",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📞 Позвонить", url="tel:+79776067750")],
-            [InlineKeyboardButton(text="💬 Telegram", url="https://t.me/RMservice99")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")]
-        ])
+            [InlineKeyboardButton(text="📢 Наш канал", url=CHANNEL_URL)],
+            [InlineKeyboardButton(text="💬 Написать менеджеру", url=MANAGER_URL)],
+            home_button(),
+        ]),
     )
     await call.answer()
+
 
 @dp.callback_query(F.data == "manager")
 async def manager(call: CallbackQuery):
     await call.message.edit_text(
         "👨‍💻 <b>Связаться с менеджером</b>\n\nНажмите кнопку ниже, чтобы открыть Telegram.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Написать менеджеру", url="https://t.me/RMservice99")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")]
-        ])
+            [InlineKeyboardButton(text="💬 Написать менеджеру", url=MANAGER_URL)],
+            home_button(),
+        ]),
     )
     await call.answer()
 
+
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Не задан BOT_TOKEN. Укажите новый токен бота в переменной окружения.")
+        raise RuntimeError("Не задан BOT_TOKEN. Укажите токен бота в Railway -> Variables.")
     await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
