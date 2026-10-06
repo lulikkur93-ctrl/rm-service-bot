@@ -40,7 +40,7 @@ CHANNEL_ID = int(_channel) if _channel.lstrip("-").isdigit() else _channel
 MARKUP = int(os.getenv("MARKUP", "5000"))
 MIN_PRICE = int(os.getenv("MIN_PRICE_FOR_MARKUP", "30000"))
 STATE_FILE = "state.json"
-VERSION = "3"
+VERSION = "5"
 LIMIT = 4000  # лимит Telegram на сообщение 4096, берём с запасом
 
 # "18 Pro 256Gb Black-124.000🇰🇷 🇭🇰 (1 sim+e sim)" -> название, цена, хвост
@@ -59,8 +59,19 @@ EXCLUDE_RE = re.compile(
 )
 
 
+# Ссылки и контакты поставщика: https://..., t.me/..., www..., @username
+LINK_RE = re.compile(r"(?:https?://|www\.|t\.me/|tg://)\S+|(?<!\w)@\w{3,}", re.IGNORECASE)
+
+
 def fmt(n: int) -> str:
     return f"{n:,}".replace(",", ".")
+
+
+def clean(line: str) -> str:
+    """Убирает звёздочки, лишние пробелы (в том числе неразрывные) и отступы."""
+    line = line.replace("*", "").replace("\u200b", "")
+    line = re.sub(r"[ \t\u00a0]+", " ", line)
+    return line.strip()
 
 
 def convert(text: str):
@@ -71,13 +82,20 @@ def convert(text: str):
     changed = 0
 
     for line in lines:
-        if not line.strip():
+        line = clean(line)
+        if not line:
             kinds.append("blank")
             new_lines.append(line)
             continue
         excluded = bool(EXCLUDE_RE.search(line))
+        has_link = bool(LINK_RE.search(line))
         m = PRICE_RE.match(line)
-        if excluded:
+        if has_link and m and not excluded:
+            # в строке с ценой вырезаем только ссылку
+            line = clean(LINK_RE.sub("", line))
+            m = PRICE_RE.match(line)
+        if excluded or (has_link and not m):
+            # строки без цены со ссылкой или @контактом убираем целиком
             kinds.append("drop")
             new_lines.append(line)
         elif m:
@@ -86,7 +104,7 @@ def convert(text: str):
                 price += MARKUP
                 changed += 1
             kinds.append("phone")
-            new_lines.append(f"{m.group(1)}-{fmt(price)}{m.group(3)}")
+            new_lines.append(f"{m.group(1).rstrip()}-{fmt(price)}{m.group(3)}")
         else:
             kinds.append("text")
             new_lines.append(line)
@@ -291,4 +309,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
