@@ -2,9 +2,10 @@
 Бот для обновления прайса в канале.
 
 Как пользоваться:
-1. Перешлите боту (в личку) пост с ценами из канала поставщика.
+1. Перешлите боту (в личку) посты с ценами из канала поставщика.
    Если прайс пришёл несколькими сообщениями, пересылайте подряд.
-2. Через 3 секунды бот добавит наценку и обновит посты в вашем канале.
+2. Через 3 секунды бот уберёт лишнее (зарядки, адаптеры, гарантии, asis),
+   добавит наценку и обновит посты в вашем канале.
 
 Переменные окружения (Railway -> Variables):
   BOT_TOKEN              токен ОТДЕЛЬНОГО бота для прайса (не того, что принимает заявки)
@@ -12,7 +13,6 @@
   CHANNEL_ID             @имя_канала или -100xxxxxxxxxx
   MARKUP                 наценка в рублях, по умолчанию 5000
   MIN_PRICE_FOR_MARKUP   наценка только на цены от этой суммы, по умолчанию 30000
-                         (чтобы не прибавлять 5000 к зарядкам и аксессуарам)
   PRICE_MESSAGE_IDS      id постов с прайсом через запятую (бот сам подскажет после первого запуска)
 """
 import json
@@ -40,16 +40,21 @@ CHANNEL_ID = int(_channel) if _channel.lstrip("-").isdigit() else _channel
 MARKUP = int(os.getenv("MARKUP", "5000"))
 MIN_PRICE = int(os.getenv("MIN_PRICE_FOR_MARKUP", "30000"))
 STATE_FILE = "state.json"
+VERSION = "3"
 LIMIT = 4000  # лимит Telegram на сообщение 4096, берём с запасом
 
 # "18 Pro 256Gb Black-124.000🇰🇷 🇭🇰 (1 sim+e sim)" -> название, цена, хвост
 PRICE_RE = re.compile(r"^(.*?)-(\d{1,3}(?:\.\d{3})+)(?!\d)(.*)$")
 
-# Что НЕ копируем в ваш прайс: зарядки, чехлы, дополнительная гарантия, позиции asis.
-# Если слово есть в заголовке раздела (строка без цены), пропускается весь раздел
-# до следующего заголовка. Если в строке с ценой, пропускается только она.
+# Что НЕ копируем: зарядки, блоки/адаптеры, чехлы, дополнительная гарантия,
+# позиции asis, строки "От 10шт ..." (оптовые цены на аксессуары),
+# строки "+3 месяца -3.000" (платная гарантия).
 EXCLUDE_RE = re.compile(
-    r"заряд|чехол|\bas[\s\-]?is\b|(?:платн|доп)\w*\.?\s*гаранти|applecare",
+    r"заряд|чехол|адаптер|adapter|блок"
+    r"|\bas[\s\-]?is\b"
+    r"|(?:платн|доп)\w*\.?\s*гаранти|applecare"
+    r"|\+\s*\d+\s*мес"
+    r"|^\s*от\s+\d+",
     re.IGNORECASE,
 )
 
@@ -59,30 +64,65 @@ def fmt(n: int) -> str:
 
 
 def convert(text: str):
-    out, changed, removed, suspicious = [], 0, 0, []
-    skipping = False
-    for line in text.split("\n"):
+    """Возвращает: готовый текст, сколько цен изменено, сколько строк убрано,
+    список подозрительных строк."""
+    lines = text.split("\n")
+    kinds, new_lines = [], []
+    changed = 0
+
+    for line in lines:
+        if not line.strip():
+            kinds.append("blank")
+            new_lines.append(line)
+            continue
+        excluded = bool(EXCLUDE_RE.search(line))
         m = PRICE_RE.match(line)
-        if not m and line.strip():
-            # строка без цены считается заголовком раздела
-            skipping = bool(EXCLUDE_RE.search(line))
-            if skipping:
-                removed += 1
-                continue
-        if m:
-            if skipping or EXCLUDE_RE.search(line):
-                removed += 1
-                continue
+        if excluded:
+            kinds.append("drop")
+            new_lines.append(line)
+        elif m:
             price = int(m.group(2).replace(".", ""))
             if price >= MIN_PRICE:
                 price += MARKUP
                 changed += 1
-            line = f"{m.group(1)}-{fmt(price)}{m.group(3)}"
-        elif re.search(r"\d\.\d{3}", line):
-            suspicious.append(line)
-        out.append(line)
-    result = re.sub(r"\n{3,}", "\n\n", "\n".join(out))
-    return result, changed, removed, suspicious
+            kinds.append("phone")
+            new_lines.append(f"{m.group(1)}-{fmt(price)}{m.group(3)}")
+        else:
+            kinds.append("text")
+            new_lines.append(line)
+
+    # Идём снизу вверх: строки с ценой оставляем, а строки без цены (заголовки)
+    # оставляем только если они стоят прямо над оставленными ценами
+    # (не больше двух заголовков подряд). Так пропадают описания и хвосты.
+    keep = [False] * len(lines)
+    dist = 2
+    for i in range(len(lines) - 1, -1, -1):
+        k = kinds[i]
+        if k == "phone":
+            keep[i] = True
+            dist = 0
+        elif k == "drop":
+            dist = 2
+        elif k == "text":
+            if dist < 2:
+                keep[i] = True
+                dist += 1
+
+    out, removed, suspicious = [], 0, []
+    for i, line in enumerate(new_lines):
+        if kinds[i] == "blank":
+            if out and out[-1].strip():
+                out.append("")
+            continue
+        if keep[i]:
+            out.append(line)
+            if kinds[i] == "text" and re.search(r"\d\.\d{3}", line):
+                suspicious.append(line)
+        else:
+            removed += 1
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out), changed, removed, suspicious
 
 
 def chunks(text: str):
@@ -115,7 +155,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     await update.message.reply_text(
-        "Перешлите мне прайс поставщика, я добавлю наценку "
+        f"Версия бота: {VERSION}\n\n"
+        "Перешлите мне прайс поставщика, я уберу лишнее, добавлю наценку "
         f"{fmt(MARKUP)} ₽ и обновлю посты в канале.\n\n"
         "/new — опубликовать прайс новыми постами (старые id забыть)."
     )
@@ -130,14 +171,39 @@ async def new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def message_kind(msg) -> str:
+    for name, label in (
+        ("photo", "фото"),
+        ("video", "видео"),
+        ("document", "файл"),
+        ("animation", "гифка"),
+        ("sticker", "стикер"),
+        ("poll", "опрос"),
+        ("voice", "голосовое"),
+        ("audio", "аудио"),
+    ):
+        if getattr(msg, name, None):
+            return label
+    return "другое"
+
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or update.effective_user.id != OWNER_ID:
         return
     text = msg.text or msg.caption
+    logging.info("Сообщение: есть текст=%s, символов=%s", bool(text), len(text or ""))
     if not text:
+        await msg.reply_text(
+            f"В этом сообщении нет текста (это {message_kind(msg)}). "
+            "Нужны посты с текстом прайса."
+        )
         return
-    context.application.bot_data.setdefault("buf", []).append(text)
+    buf = context.application.bot_data.setdefault("buf", [])
+    first = not buf
+    buf.append(text)
+    if first:
+        await msg.reply_text("Принял. Если будут ещё части, пересылайте сейчас.")
     for job in context.job_queue.get_jobs_by_name("flush"):
         job.schedule_removal()
     context.job_queue.run_once(flush, 3, chat_id=msg.chat_id, name="flush")
@@ -187,7 +253,7 @@ async def flush(context: ContextTypes.DEFAULT_TYPE):
     save_ids(new_ids)
 
     reply = (
-        f"Готово: обновлено цен {changed}, пропущено строк {removed}, "
+        f"Готово: обновлено цен {changed}, убрано строк {removed}, "
         f"постов {len(parts)}."
     )
     if new_ids != ids:
@@ -201,19 +267,28 @@ async def flush(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id, reply)
 
 
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    logging.error("Ошибка в боте", exc_info=context.error)
+    try:
+        await context.bot.send_message(
+            OWNER_ID,
+            f"Ошибка: {type(context.error).__name__}: {context.error}",
+        )
+    except Exception:
+        pass
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new))
     app.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE
-            & ((filters.TEXT & ~filters.COMMAND) | filters.CAPTION),
-            on_text,
-        )
+        MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message)
     )
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
+
