@@ -46,11 +46,13 @@ MARKUP = int(os.getenv("MARKUP", "5000"))
 MIN_PRICE = int(os.getenv("MIN_PRICE_FOR_MARKUP", "30000"))
 WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "60"))
 STATE_FILE = "state.json"
-VERSION = "6"
+VERSION = "7"
 LIMIT = 3800  # лимит Telegram 4096, берём с запасом (теги тоже считаем)
 
 # "18 Pro 256Gb Black-124.000🇰🇷 🇭🇰 (1 sim+e sim)" -> название, цена, хвост
-PRICE_RE = re.compile(r"^(.*?)-(\d{1,3}(?:\.\d{3})+)(?!\d)(.*)$")
+# Подходит и вариант с пробелами: "18 Pro Max 2Tb Black - 255.000 (🇭🇰, 1 SIM + eSIM)"
+# (дефис может быть длинным: – или —)
+PRICE_RE = re.compile(r"^(.*?)\s*[-–—]\s*(\d{1,3}(?:\.\d{3})+)(?!\d)(.*)$")
 
 # Что НЕ копируем: зарядки, блоки/адаптеры, чехлы, дополнительная гарантия,
 # позиции asis, оптовые строки "От 10шт ...", строки "+3 месяца -3.000".
@@ -450,4 +452,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
