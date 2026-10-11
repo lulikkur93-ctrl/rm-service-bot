@@ -1,5 +1,5 @@
 """
-Бот для подготовки и публикации прайса в канале (версия 10).
+Бот для подготовки и публикации прайса в канале (версия 11).
 
 Как пользоваться:
 1. Вставьте боту текст прайса (можно несколькими сообщениями).
@@ -62,7 +62,7 @@ MIN_PRICE = int(os.getenv("MIN_PRICE_FOR_MARKUP", "30000"))
 WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "60"))
 MENU_TEXT = os.getenv("MENU_TEXT", "📱 Выберите модель iPhone или нужный раздел:")
 STATE_FILE = os.getenv("STATE_PATH", "state.json")
-VERSION = "10"
+VERSION = "11"
 LIMIT = 3800  # лимит Telegram 4096, берём с запасом (теги тоже считаем)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -425,20 +425,84 @@ async def new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------- чтение текста из сообщения ----------
+
+# поля сообщения, где точно нет прайса (чтобы не принять за текст имя или ссылку)
+RAW_SKIP = {
+    "from", "sender_chat", "chat", "forward_origin", "forward_from",
+    "forward_from_chat", "via_bot", "entities", "caption_entities",
+    "reply_markup", "link_preview_options", "reply_to_message",
+    "file_id", "file_unique_id", "mime_type", "file_name", "thumbnail",
+    "type", "username", "language_code",
+}
+PRICE_HINT_RE = re.compile(r"\d\.\d{3}")
+
+
+def raw_strings(obj):
+    """Все строки внутри «сырого» сообщения (кроме служебных полей)."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k not in RAW_SKIP:
+                yield from raw_strings(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from raw_strings(v)
+    elif isinstance(obj, str):
+        yield obj
+
+
+def extract_text(msg):
+    """Текст сообщения: обычный текст, подпись, а если их нет, то любые строки
+    с ценами из «сырых» данных (на случай нового типа сообщений Telegram).
+    Возвращает (текст или None, откуда взят)."""
+    text = msg.text or msg.caption
+    if text:
+        return text, "text"
+    try:
+        raw = msg.to_dict()
+    except Exception:
+        return None, None
+    strings = list(raw_strings(raw))
+    if any(PRICE_HINT_RE.search(s) for s in strings):
+        # берём строки с ценами и более-менее длинные (названия моделей над ценами)
+        found = [s for s in strings if PRICE_HINT_RE.search(s) or len(s) >= 12]
+        return "\n".join(found), "raw"
+    return None, None
+
+
+def describe_message(msg):
+    """Для диагностики: названия полей сообщения и короткий дамп для логов."""
+    try:
+        raw = msg.to_dict()
+    except Exception:
+        return "не удалось прочитать", ""
+    skip = {"message_id", "date", "from", "chat", "forward_origin"}
+    fields = ", ".join(k for k in raw if k not in skip) or "только служебные данные"
+    return fields, json.dumps(raw, ensure_ascii=False, default=str)[:2500]
+
+
 # ---------- приём текста ----------
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or update.effective_user.id != OWNER_ID:
         return
-    text = msg.text or msg.caption
-    logging.info("Сообщение: есть текст=%s, символов=%s", bool(text), len(text or ""))
+    text, source = extract_text(msg)
+    logging.info(
+        "Сообщение: источник текста=%s, символов=%s", source, len(text or "")
+    )
     if not text:
+        fields, dump = describe_message(msg)
+        logging.warning("Сообщение без текста, поля: %s | %s", fields, dump)
         await msg.reply_text(
-            "В этом сообщении нет текста. Нужен текст прайса: скопируйте его "
-            "из поста поставщика и вставьте сюда."
+            "Бот не видит текст в этом сообщении.\n"
+            f"Из чего оно состоит: {fields}\n\n"
+            "Пришлите этот список мне, я подстрою бота. А пока скопируйте текст "
+            "поста (нажмите на текст, затем «Копировать») и вставьте сюда."
         )
         return
+    if source == "raw":
+        await msg.reply_text("Текст нашёл в служебных полях сообщения, беру его.")
     bd = context.application.bot_data
     buf = bd.setdefault("buf", [])
     first = not buf
