@@ -1,5 +1,5 @@
 """
-Бот для подготовки и публикации прайса в канале (версия 14).
+Бот для подготовки и публикации прайса в канале (версия 16).
 
 Как пользоваться:
 1. Вставьте боту текст прайса (можно несколькими сообщениями).
@@ -18,8 +18,11 @@
   MARKUP                 наценка в рублях, по умолчанию 5000
   MIN_PRICE_FOR_MARKUP   наценка только на цены от этой суммы, по умолчанию 30000
   WAIT_SECONDS           сколько ждать новые части текста, по умолчанию 60
-  COMBINE_GENERATIONS    поколения iPhone, которые идут ОДНИМ постом (по умолчанию 13,14,15);
-                         остальные модели: одна модель = один пост
+  COMBINE_GENERATIONS    поколения iPhone, которые идут ОДНИМ постом (по умолчанию 12,13,14,15);
+  SPLIT_GENERATIONS      поколения iPhone, которые идут ДВУМЯ постами: обычные (16, 16E,
+                         16 Plus) и Pro (16 Pro, 16 Pro Max); по умолчанию 16,17
+                         остальные поколения (18 и новее): одно поколение = один пост
+  MENU_ENABLED           1 = бот сам ведёт пост-меню с кнопками (по умолчанию 0: кнопки вы делаете сами)
   ORDER_URL              куда ведёт кнопка «Заказать» (@имя, t.me/... или https://...)
   REPAIR_URL             куда ведёт кнопка «Ремонт»
   ABOUT_URL              куда ведёт кнопка «О нас» (например, ссылка на пост)
@@ -64,7 +67,8 @@ MIN_PRICE = int(os.getenv("MIN_PRICE_FOR_MARKUP", "30000"))
 WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "60"))
 MENU_TEXT = os.getenv("MENU_TEXT", "📱 Выберите модель iPhone или нужный раздел:")
 STATE_FILE = os.getenv("STATE_PATH", "state.json")
-VERSION = "14"
+VERSION = "16"
+MENU_ENABLED = os.getenv("MENU_ENABLED", "0") == "1"  # кнопки в канале: по умолчанию выключены
 LIMIT = 3800  # лимит Telegram 4096, берём с запасом (теги тоже считаем)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -291,7 +295,13 @@ def build_posts(blocks, block_group=None):
 # Поколения, которые идут одним постом (13, 14, 15 по умолчанию)
 COMBINE_GENS = {
     int(x)
-    for x in os.getenv("COMBINE_GENERATIONS", "13,14,15").split(",")
+    for x in os.getenv("COMBINE_GENERATIONS", "12,13,14,15").split(",")
+    if x.strip().isdigit()
+}
+# Поколения, которые делятся на ДВА поста: обычные (простая, E, Plus, Air) и Pro/Pro Max
+SPLIT_GENS = {
+    int(x)
+    for x in os.getenv("SPLIT_GENERATIONS", "16,17").split(",")
     if x.strip().isdigit()
 }
 if len(COMBINE_GENS) > 1:
@@ -366,7 +376,15 @@ def regroup(blocks):
             if not mdl:
                 rest.append(line)
                 continue
-            key = "legacy" if mdl["legacy"] else mdl["title"]
+            if mdl["legacy"]:
+                key = "legacy"
+            elif mdl["gen"] in SPLIT_GENS:
+                is_pro = mdl["variant"] in ("Pro", "Pro Max")
+                key = f"split{mdl['gen']}{'pro' if is_pro else 'base'}"
+            elif mdl["gen"] is not None:
+                key = f"gen{mdl['gen']}"  # остальные поколения (18 и новее) одним постом
+            else:
+                key = mdl["title"]
             g = groups.get(key)
             if g is None:
                 g = groups[key] = {"subs": {}, "legacy": mdl["legacy"]}
@@ -376,6 +394,14 @@ def regroup(blocks):
         if rest:
             other.append((heads, rest))
 
+    def order_key(k):
+        g = groups[k]
+        gens = [x["model"]["gen"] or 0 for x in g["subs"].values()]
+        is_pro = any(x["model"]["variant"] in ("Pro", "Pro Max") for x in g["subs"].values())
+        # сначала новые поколения, у каждого: обычные, потом Pro; старые (12-15) в конце
+        return (1 if g["legacy"] else 0, -max(gens), 1 if is_pro else 0)
+
+    order.sort(key=order_key)
     new_blocks, block_group, group_title, warnings = [], [], {}, []
     gid = 0
     for key in order:
@@ -393,7 +419,12 @@ def regroup(blocks):
                     "этих моделей в нём не останется."
                 )
         else:
-            group_title[gid] = subs[0]["model"]["title"]
+            subs.sort(key=lambda x: variant_rank(x["model"]["variant"]))
+            if len(subs) == 1:
+                group_title[gid] = subs[0]["model"]["title"]
+            else:  # "iPhone 16, 16E, 16 Plus"
+                names = [x["model"]["title"].replace("iPhone ", "", 1) for x in subs]
+                group_title[gid] = "iPhone " + ", ".join(names)
         for sub in subs:
             new_blocks.append(([sub["model"]["title"]], sub["lines"]))
             block_group.append(gid)
@@ -527,8 +558,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Через {WAIT_SECONDS} сек. после последнего сообщения (или по кнопке) "
         "пришлю черновик. В канал ничего не уходит, пока вы не нажмёте "
         "«Опубликовать». Перед публикацией бот спросит, какой из постов в канале "
-        "заменить. При публикации бот ведёт в канале пост с кнопками: "
-        "названия iPhone, «Заказать», «Ремонт», «О нас».\n\n"
+        "заменить. Кнопок бот не делает: они ваши.\n\n"
         "/new: забыть старые посты (следующий прайс будет новыми постами)."
     )
 
@@ -822,8 +852,9 @@ async def make_draft(bot, bd, chat_id):
             f"убрано строк {removed}."
         )
     head += "\n\nПосты: " + "; ".join(f"{i + 1}. {t}" for i, t in enumerate(titles))
-    names = [label for label, _ in items] + [t for t, _e, u in STATIC_BUTTONS if u]
-    head += "\n\nКнопки в канале: " + (", ".join(names) if names else "нет")
+    if MENU_ENABLED:
+        names = [label for label, _ in items] + [t for t, _e, u in STATIC_BUTTONS if u]
+        head += "\n\nКнопки в канале: " + (", ".join(names) if names else "нет")
     if warnings:
         head += "\n\n" + "\n".join(warnings)
     if suspicious:
@@ -1038,19 +1069,21 @@ async def do_publish(bot, bd, chat_id, mapping):
     for j in range(len(draft["posts"])):
         if j not in res["actual"]:
             lines.append(f"Пост {j + 1} ({draft['post_titles'][j]}): пропущен")
-    reply = f"✅ Готово. Кнопок моделей в меню: {res['buttons']}.\n\n" + "\n".join(lines)
+    reply = "✅ Готово.\n\n" + "\n".join(lines)
+    if MENU_ENABLED:
+        reply += f"\n\nКнопок моделей в меню: {res['buttons']}."
 
     env_lines = []
     if res["ids"] != res["old_ids"]:
         env_lines.append(f"PRICE_MESSAGE_IDS={','.join(map(str, res['ids']))}")
-    if res["menu_id"] != res["old_menu"]:
+    if MENU_ENABLED and res["menu_id"] != res["old_menu"]:
         env_lines.append(f"MENU_MESSAGE_ID={res['menu_id']}")
     if env_lines:
         reply += (
             "\n\nДобавьте в Railway переменные, чтобы id не потерялись "
             "после перезапуска:\n" + "\n".join(env_lines)
         )
-    missing = [(t, e) for t, e, u in STATIC_BUTTONS if not u]
+    missing = [(t, e) for t, e, u in STATIC_BUTTONS if not u] if MENU_ENABLED else []
     if missing:
         reply += "\n\nНет ссылок для кнопок, добавьте переменные в Railway:\n"
         reply += "\n".join(f"{e} ({t})" for t, e in missing)
@@ -1065,7 +1098,7 @@ async def publish_routed(bot, draft, mapping):
     old_ids, old_menu = list(ids), state["menu"]
     menu_id = state["menu"]
 
-    if menu_id is None:
+    if MENU_ENABLED and menu_id is None:
         # меню создаём первым, чтобы оно было выше прайса
         sent = await bot.send_message(CHANNEL_ID, MENU_TEXT)
         menu_id = sent.message_id
@@ -1122,16 +1155,17 @@ async def publish_routed(bot, draft, mapping):
                 break
         else:
             menu_list.append([label, mid])
-    kb = build_menu_kb(menu_list)
-    try:
-        await bot.edit_message_text(
-            MENU_TEXT, chat_id=CHANNEL_ID, message_id=menu_id, reply_markup=kb
-        )
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            logging.warning("Меню не обновилось, отправляю новое: %s", e)
-            sent = await bot.send_message(CHANNEL_ID, MENU_TEXT, reply_markup=kb)
-            menu_id = sent.message_id
+    if MENU_ENABLED:
+        kb = build_menu_kb(menu_list)
+        try:
+            await bot.edit_message_text(
+                MENU_TEXT, chat_id=CHANNEL_ID, message_id=menu_id, reply_markup=kb
+            )
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                logging.warning("Меню не обновилось, отправляю новое: %s", e)
+                sent = await bot.send_message(CHANNEL_ID, MENU_TEXT, reply_markup=kb)
+                menu_id = sent.message_id
 
     state.update(ids=ids, menu=menu_id, posts=posts_meta, menu_items=menu_list)
     save_state(state)
