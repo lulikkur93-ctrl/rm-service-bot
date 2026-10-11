@@ -1,5 +1,5 @@
 """
-Бот для подготовки и публикации прайса в канале (версия 12).
+Бот для подготовки и публикации прайса в канале (версия 13).
 
 Как пользоваться:
 1. Вставьте боту текст прайса (можно несколькими сообщениями).
@@ -62,7 +62,7 @@ MIN_PRICE = int(os.getenv("MIN_PRICE_FOR_MARKUP", "30000"))
 WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "60"))
 MENU_TEXT = os.getenv("MENU_TEXT", "📱 Выберите модель iPhone или нужный раздел:")
 STATE_FILE = os.getenv("STATE_PATH", "state.json")
-VERSION = "12"
+VERSION = "13"
 LIMIT = 3800  # лимит Telegram 4096, берём с запасом (теги тоже считаем)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -451,10 +451,37 @@ def raw_strings(obj):
         yield obj
 
 
+def rich_to_text(node) -> str:
+    """Текст из блоков нового формата Telegram (rich_message): жирный и прочие
+    фрагменты склеиваются, а вставки-эмодзи (custom_emoji, в том числе флаги)
+    заменяются на настоящее эмодзи из поля alternative_text."""
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, (list, tuple)):
+        return "".join(rich_to_text(x) for x in node)
+    if isinstance(node, dict):
+        kind = node.get("type")
+        if kind == "custom_emoji" or ("alternative_text" in node and "text" not in node):
+            return node.get("alternative_text") or ""
+        if kind in ("line_break", "break", "br", "newline"):
+            return "\n"
+        if "text" in node:
+            return rich_to_text(node["text"])
+        if "items" in node:
+            return "\n".join(rich_to_text(x) for x in node["items"])
+        if "blocks" in node:
+            return "\n".join(rich_to_text(x) for x in node["blocks"])
+        if "caption" in node:
+            return rich_to_text(node["caption"])
+    return ""
+
+
 def extract_text(msg):
-    """Текст сообщения: обычный текст, подпись, а если их нет, то любые строки
-    с ценами из «сырых» данных (на случай нового типа сообщений Telegram).
-    Возвращает (текст или None, откуда взят)."""
+    """Текст сообщения: обычный текст, подпись, блоки rich_message (новый формат
+    постов с флагами-эмодзи), а если и их нет, то любые строки с ценами из
+    «сырых» данных. Возвращает (текст или None, откуда взят)."""
     text = msg.text or msg.caption
     if text:
         return text, "text"
@@ -462,6 +489,11 @@ def extract_text(msg):
         raw = msg.to_dict()
     except Exception:
         return None, None
+    rich = raw.get("rich_message")
+    if isinstance(rich, dict) and rich.get("blocks"):
+        joined = "\n".join(rich_to_text(b) for b in rich["blocks"])
+        if joined.strip():
+            return joined, "rich"
     strings = list(raw_strings(raw))
     if any(PRICE_HINT_RE.search(s) for s in strings):
         # берём строки с ценами и более-менее длинные (названия моделей над ценами)
@@ -510,6 +542,8 @@ def outline_message(raw):
     """Короткое описание сообщения: общий вид и места, где лежат флаги/эмодзи."""
     lines, counts = [], {}
     for path, v in leaves(raw):
+        if path.startswith("rich_message"):
+            continue  # блоки разобраны отдельно, см. blocks_summary
         base = re.sub(r"\[\d+\]", "[]", path)
         counts[base] = counts.get(base, 0) + 1
         if counts[base] <= 3:  # по три примера на каждый вид поля
@@ -526,12 +560,46 @@ def outline_message(raw):
     return lines[:70], marks[:12]
 
 
+def blocks_summary(raw):
+    """Какие бывают блоки в rich_message и как выглядят не-текстовые (картинки и т.п.)."""
+    rich = raw.get("rich_message")
+    if not isinstance(rich, dict):
+        return None
+    blocks = rich.get("blocks") or []
+    counts, others = {}, []
+    for i, b in enumerate(blocks):
+        kind = b.get("type") if isinstance(b, dict) else type(b).__name__
+        counts[kind] = counts.get(kind, 0) + 1
+        if kind != "paragraph" and len(others) < 4:
+            others.append((i, b))
+    lines = ["Типы блоков: " + ", ".join(f"{k} x{c}" for k, c in counts.items())]
+    for k, v in rich.items():  # другие поля rich_message, кроме самих блоков
+        if k != "blocks":
+            for path, val in leaves(v, f"rich_message.{k}"):
+                lines.append(f"{path} = {short(val)}")
+    for i, b in others:
+        n = 0
+        for path, val in leaves(b, f"blocks[{i}]"):
+            lines.append(f"{path} = {short(val)}")
+            n += 1
+            if n >= 12:
+                lines.append("...")
+                break
+    return lines[:40]
+
+
 async def send_outline(msg):
     try:
         raw = msg.to_dict()
     except Exception as e:
         await msg.reply_text(f"Не удалось прочитать сообщение: {e}")
         return
+    summary = blocks_summary(raw)
+    if summary:
+        await msg.reply_text(
+            "Блоки поста:\n<pre>" + esc("\n".join(summary)) + "</pre>",
+            parse_mode=ParseMode.HTML,
+        )
     lines, marks = outline_message(raw)
     text = "Поля сообщения:\n" + "\n".join(lines)
     chunks, cur = [], ""
