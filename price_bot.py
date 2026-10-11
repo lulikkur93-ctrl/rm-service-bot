@@ -1,5 +1,5 @@
 """
-Бот для подготовки и публикации прайса в канале (версия 13).
+Бот для подготовки и публикации прайса в канале (версия 14).
 
 Как пользоваться:
 1. Вставьте боту текст прайса (можно несколькими сообщениями).
@@ -18,6 +18,8 @@
   MARKUP                 наценка в рублях, по умолчанию 5000
   MIN_PRICE_FOR_MARKUP   наценка только на цены от этой суммы, по умолчанию 30000
   WAIT_SECONDS           сколько ждать новые части текста, по умолчанию 60
+  COMBINE_GENERATIONS    поколения iPhone, которые идут ОДНИМ постом (по умолчанию 13,14,15);
+                         остальные модели: одна модель = один пост
   ORDER_URL              куда ведёт кнопка «Заказать» (@имя, t.me/... или https://...)
   REPAIR_URL             куда ведёт кнопка «Ремонт»
   ABOUT_URL              куда ведёт кнопка «О нас» (например, ссылка на пост)
@@ -62,7 +64,7 @@ MIN_PRICE = int(os.getenv("MIN_PRICE_FOR_MARKUP", "30000"))
 WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "60"))
 MENU_TEXT = os.getenv("MENU_TEXT", "📱 Выберите модель iPhone или нужный раздел:")
 STATE_FILE = os.getenv("STATE_PATH", "state.json")
-VERSION = "13"
+VERSION = "14"
 LIMIT = 3800  # лимит Telegram 4096, берём с запасом (теги тоже считаем)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -244,7 +246,7 @@ def render_block(heads, phones) -> str:
     return "\n\n".join(parts)
 
 
-def build_posts(blocks):
+def build_posts(blocks, block_group=None):
     """Склеивает блоки в посты до LIMIT. Режем только по границе блока
     (а слишком длинный блок по строкам, повторяя заголовок).
     Возвращает посты и словарь: номер блока -> номер поста, где он начинается."""
@@ -264,20 +266,145 @@ def build_posts(blocks):
         if cur:
             rendered.append((bi, render_block(heads, cur)))
 
-    posts, block_post, cur = [], {}, ""
+    # block_group: номер группы для каждого блока. Блоки разных групп (разных
+    # моделей) никогда не попадают в один пост.
+    posts, block_post, post_group, cur, cur_group = [], {}, {}, "", None
     for bi, r in rendered:
-        if cur and len(cur) + 2 + len(r) > LIMIT:
+        g = block_group[bi] if block_group else None
+        if cur and (len(cur) + 2 + len(r) > LIMIT or g != cur_group):
             posts.append(cur)
             cur = r
         else:
             cur = f"{cur}\n\n{r}" if cur else r
+        cur_group = g
         block_post.setdefault(bi, len(posts))
+        post_group.setdefault(len(posts), g)
     if cur:
         posts.append(cur)
-    return posts, block_post
+    return posts, block_post, post_group
 
 
 # ---------- названия моделей, меню, подбор постов ----------
+
+# ---------- раскладка по моделям ----------
+
+# Поколения, которые идут одним постом (13, 14, 15 по умолчанию)
+COMBINE_GENS = {
+    int(x)
+    for x in os.getenv("COMBINE_GENERATIONS", "13,14,15").split(",")
+    if x.strip().isdigit()
+}
+if len(COMBINE_GENS) > 1:
+    LEGACY_TITLE = "iPhone " + ", ".join(str(x) for x in sorted(COMBINE_GENS))
+elif COMBINE_GENS:
+    LEGACY_TITLE = f"iPhone {min(COMBINE_GENS)}"
+else:
+    LEGACY_TITLE = ""
+
+# "17 Pro Max 2Tb Blue", "Air 256 Blue", "15 Plus 128 Pink", "17E 256", "iPhone 16 Pro"
+MODEL_START_RE = re.compile(
+    r"^[^\w]*(?:iphone\s*)?(?:(?P<gen>1[0-9]|[89])(?P<e>e)?|(?P<name>air|duo|fold|flip))"
+    r"\b\s*(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+NOT_IPHONE_RE = re.compile(r"airpods|ipad|macbook|imac|mac\s*mini|watch|samsung|galaxy|pixel|xiaomi|huawei|honor|dyson", re.IGNORECASE)
+VARIANT_RE = re.compile(r"\s*(pro\s*max|pro|plus|mini|air|\+)(?![a-z])", re.IGNORECASE)
+VARIANT_ORDER = ["", "mini", "E", "Plus", "Pro", "Pro Max"]
+
+
+def model_of(text):
+    """Какая это модель: {'gen', 'variant', 'title', 'legacy'} или None."""
+    m = MODEL_START_RE.match(text)
+    if not m:
+        return None
+    name = m.group("name")
+    if name:
+        if name.lower() == "air":
+            return {"gen": 17, "variant": "Air", "title": "iPhone 17 Air", "legacy": False}
+        return {"gen": None, "variant": name.title(), "title": f"iPhone {name.title()}",
+                "legacy": False}
+    gen = int(m.group("gen"))
+    variant = "E" if m.group("e") else ""
+    if not variant:
+        vm = VARIANT_RE.match(m.group("rest") or "")
+        if vm:
+            v = re.sub(r"\s+", " ", vm.group(1).lower())
+            if v == "air":
+                return {"gen": 17, "variant": "Air", "title": "iPhone 17 Air", "legacy": False}
+            variant = {"pro max": "Pro Max", "promax": "Pro Max", "pro": "Pro",
+                       "plus": "Plus", "+": "Plus", "mini": "mini"}.get(v, v.title())
+    if variant == "E":
+        title = f"iPhone {gen}E"
+    else:
+        title = f"iPhone {gen}" + (f" {variant}" if variant else "")
+    return {"gen": gen, "variant": variant, "title": title, "legacy": gen in COMBINE_GENS}
+
+
+def variant_rank(v) -> int:
+    return VARIANT_ORDER.index(v) if v in VARIANT_ORDER else 99
+
+
+def regroup(blocks):
+    """Раскладывает строки с ценами по моделям: одна модель = одна группа = один пост
+    (все варианты модели вместе). Поколения из COMBINE_GENS идут одной группой,
+    внутри неё модели по порядку (13, 14, 15) с жирными подзаголовками. Строки без
+    модели (аксессуары и т.п.) остаются в группе «Прочее» со своими заголовками.
+    Возвращает: новые блоки, номер группы каждого блока, названия групп, предупреждения."""
+    groups, order, other = {}, [], []
+    for heads, phones in blocks:
+        head_model = None
+        for h in heads:
+            # общий заголовок вроде "iPhone 17/17E/Air" не годится как модель строки
+            if not re.search(r"\d\s*/\s*(\d|e\b|air)", h, re.IGNORECASE):
+                head_model = model_of(h) or head_model
+        rest = []
+        for line in phones:
+            if NOT_IPHONE_RE.search(line):  # AirPods, iPad, часы и т.п. не относим к iPhone
+                rest.append(line)
+                continue
+            mdl = model_of(line) or head_model
+            if not mdl:
+                rest.append(line)
+                continue
+            key = "legacy" if mdl["legacy"] else mdl["title"]
+            g = groups.get(key)
+            if g is None:
+                g = groups[key] = {"subs": {}, "legacy": mdl["legacy"]}
+                order.append(key)
+            sub = g["subs"].setdefault(mdl["title"], {"model": mdl, "lines": []})
+            sub["lines"].append(line)
+        if rest:
+            other.append((heads, rest))
+
+    new_blocks, block_group, group_title, warnings = [], [], {}, []
+    gid = 0
+    for key in order:
+        g = groups[key]
+        subs = list(g["subs"].values())
+        if g["legacy"]:
+            subs.sort(key=lambda x: (x["model"]["gen"], variant_rank(x["model"]["variant"])))
+            group_title[gid] = LEGACY_TITLE
+            have = {x["model"]["gen"] for x in subs}
+            missing = sorted(COMBINE_GENS - have)
+            if missing:
+                warnings.append(
+                    f"⚠️ В посте «{LEGACY_TITLE}» нет поколений: "
+                    f"{', '.join(map(str, missing))}. Если замените им старый пост, "
+                    "этих моделей в нём не останется."
+                )
+        else:
+            group_title[gid] = subs[0]["model"]["title"]
+        for sub in subs:
+            new_blocks.append(([sub["model"]["title"]], sub["lines"]))
+            block_group.append(gid)
+        gid += 1
+    if other:
+        group_title[gid] = "Прочее"
+        for b in other:
+            new_blocks.append(b)
+            block_group.append(gid)
+    return new_blocks, block_group, group_title, warnings
+
 
 def block_label(heads):
     """Название модели из заголовка блока: 'iPhone 18 Pro 256/512/1TB' -> 'iPhone 18 Pro'."""
@@ -287,36 +414,29 @@ def block_label(heads):
     return label or None
 
 
-def post_labels_and_titles(blocks, block_post, n_posts):
-    labels = [[] for _ in range(n_posts)]
-    for bi, (heads, _phones) in enumerate(blocks):
-        lab = block_label(heads)
-        p = block_post.get(bi)
-        if lab and p is not None and lab.lower() not in [x.lower() for x in labels[p]]:
-            labels[p].append(lab)
-    titles = []
-    for j, labs in enumerate(labels):
-        if labs:
-            t = ", ".join(labs[:2]) + ("…" if len(labs) > 2 else "")
-        else:
-            t = f"пост {j + 1}"
-        titles.append(t)
+def post_labels_and_titles(post_group, group_title, n_posts):
+    """Название поста = название его группы (модели). Если модель не влезла в один
+    пост и разбита на два, у второго в названии добавляется (2)."""
+    labels, titles, seen = [], [], {}
+    for j in range(n_posts):
+        title = group_title.get(post_group.get(j), f"пост {j + 1}")
+        seen[title] = seen.get(title, 0) + 1
+        labels.append([title])
+        titles.append(title if seen[title] == 1 else f"{title} ({seen[title]})")
     return labels, titles
 
 
-def menu_items(blocks, block_post):
-    """Названия iPhone для кнопок: (текст кнопки, номер поста в черновике)."""
+def menu_items(blocks, block_post, block_group, group_title):
+    """Кнопки меню: по одной на группу iPhone (текст кнопки, номер поста в черновике)."""
     items, seen = [], set()
-    for bi, (heads, phones) in enumerate(blocks):
+    for bi, (_heads, phones) in enumerate(blocks):
         if not phones:
             continue
-        label = block_label(heads)
-        if not label or not re.match(r"iphone", label, re.IGNORECASE):
+        gid = block_group[bi]
+        label = group_title.get(gid, "")
+        if gid in seen or not label.lower().startswith("iphone"):
             continue
-        key = label.lower()
-        if key in seen:
-            continue
-        seen.add(key)
+        seen.add(gid)
         items.append((label, block_post.get(bi, 0)))
     return items
 
@@ -682,9 +802,10 @@ async def make_draft(bot, bd, chat_id):
             "Цены вида «название-124.000» не найдены. Проверьте, что вставлен прайс.",
         )
         return
-    posts, block_post = build_posts(blocks)
-    items = menu_items(blocks, block_post)
-    labels, titles = post_labels_and_titles(blocks, block_post, len(posts))
+    blocks, block_group, group_title, warnings = regroup(blocks)
+    posts, block_post, post_group = build_posts(blocks, block_group)
+    items = menu_items(blocks, block_post, block_group, group_title)
+    labels, titles = post_labels_and_titles(post_group, group_title, len(posts))
     bd["draft"] = {
         "posts": posts,
         "items": items,
@@ -700,8 +821,11 @@ async def make_draft(bot, bd, chat_id):
             f"Черновик: постов {len(posts)}, цен с наценкой {changed}, "
             f"убрано строк {removed}."
         )
+    head += "\n\nПосты: " + "; ".join(f"{i + 1}. {t}" for i, t in enumerate(titles))
     names = [label for label, _ in items] + [t for t, _e, u in STATIC_BUTTONS if u]
     head += "\n\nКнопки в канале: " + (", ".join(names) if names else "нет")
+    if warnings:
+        head += "\n\n" + "\n".join(warnings)
     if suspicious:
         head += "\n\nПохоже на цену, но не распознано (проверьте):\n"
         head += "\n".join(suspicious[:5])
