@@ -1,5 +1,5 @@
 """
-Бот для подготовки и публикации прайса в канале (версия 11).
+Бот для подготовки и публикации прайса в канале (версия 12).
 
 Как пользоваться:
 1. Вставьте боту текст прайса (можно несколькими сообщениями).
@@ -62,7 +62,7 @@ MIN_PRICE = int(os.getenv("MIN_PRICE_FOR_MARKUP", "30000"))
 WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "60"))
 MENU_TEXT = os.getenv("MENU_TEXT", "📱 Выберите модель iPhone или нужный раздел:")
 STATE_FILE = os.getenv("STATE_PATH", "state.json")
-VERSION = "11"
+VERSION = "12"
 LIMIT = 3800  # лимит Telegram 4096, берём с запасом (теги тоже считаем)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -481,11 +481,92 @@ def describe_message(msg):
     return fields, json.dumps(raw, ensure_ascii=False, default=str)[:2500]
 
 
+# ---------- диагностика: как устроено сообщение (команда /raw) ----------
+
+FLAG_RE = re.compile("[\U0001F1E6-\U0001F1FF]")  # буквы-флаги (🇰🇼 и т.д.)
+OUTLINE_SKIP = {"from", "chat", "sender_chat", "date", "message_id"}
+
+
+def leaves(obj, path=""):
+    """Все «листья» сообщения: (путь, значение)."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if not path and k in OUTLINE_SKIP:
+                continue
+            yield from leaves(v, f"{path}.{k}" if path else str(k))
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            yield from leaves(v, f"{path}[{i}]")
+    else:
+        yield path, obj
+
+
+def short(v, n=70) -> str:
+    s = repr(v)
+    return s if len(s) <= n else s[: n - 2] + "…'"
+
+
+def outline_message(raw):
+    """Короткое описание сообщения: общий вид и места, где лежат флаги/эмодзи."""
+    lines, counts = [], {}
+    for path, v in leaves(raw):
+        base = re.sub(r"\[\d+\]", "[]", path)
+        counts[base] = counts.get(base, 0) + 1
+        if counts[base] <= 3:  # по три примера на каждый вид поля
+            lines.append(f"{path} = {short(v)}")
+    for base, c in counts.items():
+        if c > 3:
+            lines.append(f"... {base}: всего {c}")
+    marks = []
+    for path, v in leaves(raw):
+        if "emoji" in path.lower() or (
+            isinstance(v, str) and (FLAG_RE.search(v) or "📱" in v)
+        ):
+            marks.append(f"{path} = {short(v, 90)}")
+    return lines[:70], marks[:12]
+
+
+async def send_outline(msg):
+    try:
+        raw = msg.to_dict()
+    except Exception as e:
+        await msg.reply_text(f"Не удалось прочитать сообщение: {e}")
+        return
+    lines, marks = outline_message(raw)
+    text = "Поля сообщения:\n" + "\n".join(lines)
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > 3300:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    chunks.append(cur)
+    for c in chunks[:2]:
+        await msg.reply_text(f"<pre>{esc(c)}</pre>", parse_mode=ParseMode.HTML)
+    where = "\n".join(marks) if marks else "флаги и эмодзи в полях не найдены"
+    await msg.reply_text(f"Где флаги и эмодзи:\n<pre>{esc(where)}</pre>",
+                         parse_mode=ParseMode.HTML)
+    logging.info("RAW сообщение: %s", json.dumps(raw, ensure_ascii=False, default=str)[:6000])
+
+
+async def raw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    context.application.bot_data["raw_mode"] = True
+    await update.message.reply_text(
+        "Режим диагностики. Перешлите один пост поставщика: я покажу, как он "
+        "устроен внутри. В канал и в черновик при этом ничего не уходит."
+    )
+
+
 # ---------- приём текста ----------
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or update.effective_user.id != OWNER_ID:
+        return
+    if context.application.bot_data.pop("raw_mode", False):
+        await send_outline(msg)
         return
     text, source = extract_text(msg)
     logging.info(
@@ -888,6 +969,7 @@ def main():
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new))
+    app.add_handler(CommandHandler("raw", raw_cmd))
     app.add_handler(CallbackQueryHandler(on_route, pattern=r"^r:"))
     app.add_handler(
         CallbackQueryHandler(on_button, pattern=r"^(now|pub|edit|cancel)$")
