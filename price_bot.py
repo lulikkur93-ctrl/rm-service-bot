@@ -1,5 +1,5 @@
 """
-Бот для подготовки и публикации прайса в канале (версия 16).
+Бот для подготовки и публикации прайса в канале (версия 17).
 
 Как пользоваться:
 1. Вставьте боту текст прайса (можно несколькими сообщениями).
@@ -10,6 +10,8 @@
    или пропустить. Кнопка «Автоподбор» подбирает посты сама по названию модели.
 5. Бот ведёт в канале пост-меню с кнопками: названия iPhone (ведут к нужному
    посту), «Заказать», «Ремонт», «О нас». Старые кнопки сохраняются.
+6. Команда /post: обычный пост (текст или одно фото/видео) с кнопками-ссылками.
+   Бот показывает предпросмотр и публикует только после «Опубликовать».
 
 Переменные окружения (Railway -> Variables):
   BOT_TOKEN              токен ОТДЕЛЬНОГО бота для прайса
@@ -67,7 +69,7 @@ MIN_PRICE = int(os.getenv("MIN_PRICE_FOR_MARKUP", "30000"))
 WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "60"))
 MENU_TEXT = os.getenv("MENU_TEXT", "📱 Выберите модель iPhone или нужный раздел:")
 STATE_FILE = os.getenv("STATE_PATH", "state.json")
-VERSION = "16"
+VERSION = "17"
 MENU_ENABLED = os.getenv("MENU_ENABLED", "0") == "1"  # кнопки в канале: по умолчанию выключены
 LIMIT = 3800  # лимит Telegram 4096, берём с запасом (теги тоже считаем)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
@@ -559,7 +561,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "пришлю черновик. В канал ничего не уходит, пока вы не нажмёте "
         "«Опубликовать». Перед публикацией бот спросит, какой из постов в канале "
         "заменить. Кнопок бот не делает: они ваши.\n\n"
-        "/new: забыть старые посты (следующий прайс будет новыми постами)."
+        "/new: забыть старые посты (следующий прайс будет новыми постами).\n"
+        "/post: создать обычный пост с кнопками (с предпросмотром).\n"
+        "/cancel: отменить создание поста."
     )
 
 
@@ -785,6 +789,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if context.application.bot_data.pop("raw_mode", False):
         await send_outline(msg)
+        return
+    if context.application.bot_data.get("post"):  # идёт создание поста (/post)
+        await on_post_input(update, context)
         return
     text, source = extract_text(msg)
     logging.info(
@@ -1179,6 +1186,288 @@ async def publish_routed(bot, draft, mapping):
     }
 
 
+# ---------- обычные посты с кнопками (команда /post) ----------
+
+CAPTION_LIMIT = 1024    # подпись к фото или видео не длиннее 1024 символов
+POST_TEXT_LIMIT = 4096  # обычный текстовый пост не длиннее 4096 символов
+
+# Одна кнопка: «Название - ссылка», «Название - @имя», «Название - t.me/...»,
+# «Название - сайт.ру/страница». Тире между названием и ссылкой можно не ставить.
+BUTTON_RE = re.compile(
+    r"^(?P<name>.+?)\s*[-–—:]?\s*"
+    r"(?P<url>(?:https?://|tg://|t\.me/|www\.|@\w"
+    r"|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?:/|\b))\S*)$",
+    re.IGNORECASE,
+)
+
+POST_CANCEL_KB = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🗑 Отмена", callback_data="post:cancel")]]
+)
+POST_BUTTONS_KB = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("⏭ Без кнопок", callback_data="post:nobtn")],
+        [InlineKeyboardButton("🗑 Отмена", callback_data="post:cancel")],
+    ]
+)
+POST_CTRL_KB = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("✅ Опубликовать", callback_data="post:pub")],
+        [InlineKeyboardButton("🔕 Опубликовать без звука", callback_data="post:pubs")],
+        [
+            InlineKeyboardButton("✏️ Текст", callback_data="post:txt"),
+            InlineKeyboardButton("🔘 Кнопки", callback_data="post:btn"),
+        ],
+        [InlineKeyboardButton("🗑 Отмена", callback_data="post:cancel")],
+    ]
+)
+
+POST_START_TEXT = (
+    "✍️ Новый пост (это обычный пост канала, не прайс).\n\n"
+    "Пришлите текст поста. Если нужно фото или видео, пришлите ОДНО и напишите "
+    "текст в подписи. Жирный, курсив, ссылки и эмодзи сохранятся.\n\n"
+    "В канал ничего не уйдёт, пока вы не нажмёте «Опубликовать»."
+)
+POST_BUTTONS_TEXT = (
+    "🔘 Теперь кнопки под постом.\n\n"
+    "Одна строка = одна кнопка:\n"
+    "название - ссылка\n\n"
+    "Пример:\n"
+    "Заказать - https://t.me/RMservice99\n"
+    "Отзывы - https://www.avito.ru/brands/rmservice\n\n"
+    "Две кнопки в одном ряду: поставьте между ними знак |\n"
+    "Заказать - t.me/RMservice99 | Отзывы - avito.ru/brands/rmservice\n\n"
+    "Вместо ссылки можно написать @имя. Кнопки не нужны: нажмите «Без кнопок»."
+)
+
+
+def button_url(u: str) -> str:
+    u = u.strip()
+    if u.startswith("@"):
+        return "https://t.me/" + u[1:]
+    if re.match(r"(?i)^(https?://|tg://)", u):
+        return u
+    return "https://" + u
+
+
+def parse_buttons(text: str):
+    # Возвращает ряды кнопок [[(название, ссылка), ...], ...] и список непонятых строк.
+    rows, bad = [], []
+    for line in text.split("\n"):
+        line = clean(line)
+        if not line:
+            continue
+        row, ok = [], True
+        for part in line.split("|"):
+            m = BUTTON_RE.match(part.strip())
+            if not m:
+                ok = False
+                break
+            row.append((m.group("name").strip(), button_url(m.group("url"))))
+        if ok and row:
+            rows.append(row)
+        else:
+            bad.append(line)
+    return rows, bad
+
+
+def post_kb(rows):
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(t, url=u) for t, u in row] for row in rows]
+    )
+
+
+async def send_post(bot, target, post, kb, silent=False):
+    media, text = post["media"], post["text"] or None
+    common = dict(
+        parse_mode=ParseMode.HTML, reply_markup=kb, disable_notification=silent
+    )
+    if media and media[0] == "photo":
+        return await bot.send_photo(target, media[1], caption=text, **common)
+    if media:
+        return await bot.send_video(target, media[1], caption=text, **common)
+    return await bot.send_message(target, post["text"], **common)
+
+
+async def send_preview(bot, chat_id, post):
+    try:
+        await send_post(bot, chat_id, post, post_kb(post["buttons"]))
+    except Exception as e:
+        logging.warning("Предпросмотр поста не получился: %s", e)
+        await bot.send_message(
+            chat_id,
+            f"Не получилось показать пост: {e}\n\n"
+            "Проверьте текст и ссылки в кнопках. Их можно поправить кнопками ниже.",
+            reply_markup=POST_CTRL_KB,
+        )
+        return
+    await bot.send_message(
+        chat_id,
+        "👆 Так пост будет выглядеть в канале. Публикуем?",
+        reply_markup=POST_CTRL_KB,
+    )
+
+
+async def post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    context.application.bot_data["post"] = {
+        "step": "content",
+        "text": None,
+        "media": None,
+        "buttons": [],
+    }
+    await update.message.reply_text(POST_START_TEXT, reply_markup=POST_CANCEL_KB)
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    if context.application.bot_data.pop("post", None):
+        await update.message.reply_text("Создание поста отменено. В канал ничего не ушло.")
+    else:
+        await update.message.reply_text("Сейчас нечего отменять.")
+
+
+async def on_post_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    bd = context.application.bot_data
+    post = bd["post"]
+    step = post["step"]
+
+    if step == "content":
+        media, body, plain = None, "", ""
+        if msg.photo:
+            media = ("photo", msg.photo[-1].file_id)
+            body, plain = msg.caption_html or "", msg.caption or ""
+        elif msg.video:
+            media = ("video", msg.video.file_id)
+            body, plain = msg.caption_html or "", msg.caption or ""
+        elif msg.text:
+            body, plain = msg.text_html, msg.text
+        else:
+            await msg.reply_text(
+                "Пришлите текст, фото или видео (текст тогда пишите в подписи).",
+                reply_markup=POST_CANCEL_KB,
+            )
+            return
+        if media and len(plain) > CAPTION_LIMIT:
+            await msg.reply_text(
+                f"Подпись к фото или видео не может быть длиннее {CAPTION_LIMIT} "
+                f"символов, у вас {len(plain)}. Сократите текст или пришлите пост без фото.",
+                reply_markup=POST_CANCEL_KB,
+            )
+            return
+        if len(plain) > POST_TEXT_LIMIT:
+            await msg.reply_text(
+                f"Пост не может быть длиннее {POST_TEXT_LIMIT} символов, у вас {len(plain)}.",
+                reply_markup=POST_CANCEL_KB,
+            )
+            return
+        if not media and not plain.strip():
+            await msg.reply_text("Текст пустой. Пришлите текст поста.",
+                                 reply_markup=POST_CANCEL_KB)
+            return
+        post["text"], post["media"] = body, media
+        if post.pop("editing", False):  # правили текст: кнопки остаются прежние
+            post["step"] = "ready"
+            await send_preview(context.bot, msg.chat_id, post)
+        else:
+            post["step"] = "buttons"
+            await msg.reply_text(POST_BUTTONS_TEXT, reply_markup=POST_BUTTONS_KB)
+
+    elif step == "buttons":
+        if not msg.text:
+            await msg.reply_text(
+                "Нужен текст с кнопками: название - ссылка (по одной на строку). "
+                "Или нажмите «Без кнопок».",
+                reply_markup=POST_BUTTONS_KB,
+            )
+            return
+        rows, bad = parse_buttons(msg.text)
+        if bad or not rows:
+            await msg.reply_text(
+                "Не поняла эти строки:\n" + "\n".join(bad[:5] or [msg.text[:100]])
+                + "\n\nНужно так: название - ссылка. Пришлите кнопки ещё раз.",
+                reply_markup=POST_BUTTONS_KB,
+            )
+            return
+        post["buttons"] = rows
+        post.pop("editing", None)
+        post["step"] = "ready"
+        await send_preview(context.bot, msg.chat_id, post)
+
+    else:  # ready
+        await msg.reply_text(
+            "Пост готов. Нажмите нужную кнопку под предпросмотром: "
+            "«Опубликовать», «Текст» или «Кнопки».",
+            reply_markup=POST_CTRL_KB,
+        )
+
+
+async def on_post_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID:
+        await q.answer()
+        return
+    await q.answer()
+    bd = context.application.bot_data
+    chat_id = q.message.chat_id
+    action = q.data[len("post:"):]
+    post = bd.get("post")
+
+    if action == "cancel":
+        bd.pop("post", None)
+        await q.edit_message_text("Пост отменён. В канал ничего не ушло.")
+        return
+    if not post:
+        await q.edit_message_text("Пост потерялся (бот перезапускался). Начните заново: /post")
+        return
+
+    if action == "nobtn":
+        if post["step"] != "buttons":
+            return
+        post["buttons"] = []
+        post.pop("editing", None)
+        post["step"] = "ready"
+        await q.edit_message_text("Без кнопок.")
+        await send_preview(context.bot, chat_id, post)
+
+    elif action == "txt":
+        post["step"], post["editing"] = "content", True
+        await q.edit_message_text(
+            "Пришлите новый текст (или фото/видео с подписью). Кнопки останутся прежние."
+        )
+
+    elif action == "btn":
+        post["step"], post["editing"] = "buttons", True
+        await q.edit_message_text(POST_BUTTONS_TEXT, reply_markup=POST_BUTTONS_KB)
+
+    elif action in ("pub", "pubs"):
+        if post["step"] != "ready":
+            return
+        try:
+            sent = await send_post(
+                context.bot, CHANNEL_ID, post, post_kb(post["buttons"]),
+                silent=(action == "pubs"),
+            )
+        except Exception as e:
+            logging.warning("Не удалось опубликовать пост: %s", e)
+            await q.edit_message_text(
+                f"Не получилось опубликовать: {e}\n\n"
+                "Проверьте, что бот добавлен администратором канала с правом "
+                "«Публикация сообщений». Пост сохранён: можно нажать «Опубликовать» ещё раз.",
+                reply_markup=POST_CTRL_KB,
+            )
+            return
+        bd.pop("post", None)
+        await q.edit_message_text(
+            f"✅ Опубликовано: {msg_link(sent.message_id)}",
+            link_preview_options=NO_PREVIEW,
+        )
+
+
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
     logging.error("Ошибка в боте", exc_info=context.error)
     try:
@@ -1196,6 +1485,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new))
     app.add_handler(CommandHandler("raw", raw_cmd))
+    app.add_handler(CommandHandler("post", post_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CallbackQueryHandler(on_post_button, pattern=r"^post:"))
     app.add_handler(CallbackQueryHandler(on_route, pattern=r"^r:"))
     app.add_handler(
         CallbackQueryHandler(on_button, pattern=r"^(now|pub|edit|cancel)$")
