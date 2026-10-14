@@ -1,5 +1,5 @@
 """
-Бот для подготовки и публикации прайса в канале (версия 18).
+Бот для подготовки и публикации прайса в канале (версия 19).
 
 Как пользоваться:
 1. Вставьте боту текст прайса (можно несколькими сообщениями).
@@ -13,6 +13,9 @@
 6. Кнопки внизу чата: «Новый пост» (текст или одно фото/видео + кнопки-ссылки) и
    «Править пост» (изменить текст или кнопки поста, который уже в канале).
    Везде сначала предпросмотр, в канал уходит только после подтверждения.
+   Цвет кнопки: в конце строки - style:green (или blue, red). Если переслать боту
+   пост из канала, он прочитает кнопки этого поста и при правке ничего не потеряет.
+   Кнопки можно добавить к существующим, заменить, убрать одну или все.
 
 Переменные окружения (Railway -> Variables):
   BOT_TOKEN              токен ОТДЕЛЬНОГО бота для прайса
@@ -73,7 +76,7 @@ MIN_PRICE = int(os.getenv("MIN_PRICE_FOR_MARKUP", "30000"))
 WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "60"))
 MENU_TEXT = os.getenv("MENU_TEXT", "📱 Выберите модель iPhone или нужный раздел:")
 STATE_FILE = os.getenv("STATE_PATH", "state.json")
-VERSION = "18"
+VERSION = "19"
 MENU_ENABLED = os.getenv("MENU_ENABLED", "0") == "1"  # кнопки в канале: по умолчанию выключены
 LIMIT = 3800  # лимит Telegram 4096, берём с запасом (теги тоже считаем)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
@@ -567,6 +570,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💰 Обновить прайс: пришлите текст прайса поставщика.\n"
         "🧹 Прайс заново: забыть старые посты прайса.\n"
         "❌ Отмена: отменить то, что делаете сейчас.\n\n"
+        "Кнопкам можно задать цвет: в конце строки - style:green (или blue, red).\n\n"
         "В канал ничего не уходит, пока вы не подтвердите кнопкой.",
         reply_markup=MAIN_KB,
     )
@@ -1240,8 +1244,10 @@ POST_BUTTONS_KB = InlineKeyboardMarkup(
 EDIT_MENU_KB = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("✏️ Изменить текст", callback_data="post:etxt")],
-        [InlineKeyboardButton("🔘 Кнопки: добавить или заменить", callback_data="post:ebtn")],
-        [InlineKeyboardButton("🚫 Убрать кнопки", callback_data="post:erm")],
+        [InlineKeyboardButton("➕ Добавить кнопки к существующим", callback_data="post:eadd")],
+        [InlineKeyboardButton("🔘 Заменить все кнопки", callback_data="post:ebtn")],
+        [InlineKeyboardButton("➖ Убрать одну кнопку", callback_data="post:edel")],
+        [InlineKeyboardButton("🚫 Убрать все кнопки", callback_data="post:erm")],
         [InlineKeyboardButton("↩️ Выбрать другой пост", callback_data="post:repick")],
         [InlineKeyboardButton("🗑 Отмена", callback_data="post:cancel")],
     ]
@@ -1262,6 +1268,8 @@ POST_BUTTONS_TEXT = (
     "Отзывы - https://www.avito.ru/brands/rmservice\n\n"
     "Две кнопки в одном ряду: поставьте между ними знак |\n"
     "Заказать - t.me/RMservice99 | Отзывы - avito.ru/brands/rmservice\n\n"
+    "Цвет кнопки (необязательно): в конце строки - style:green, style:blue или style:red\n"
+    "Заказать - t.me/RMservice99 - style:green\n\n"
     "Вместо ссылки можно написать @имя. Кнопки не нужны: нажмите «Без кнопок»."
 )
 PICK_TEXT = (
@@ -1271,6 +1279,101 @@ PICK_TEXT = (
     "Чтобы бот мог править посты, он должен быть админом канала с правом "
     "«Изменение сообщений других»."
 )
+
+
+ADD_BUTTONS_TEXT = (
+    "➕ Пришлите новые кнопки. Они встанут в конец, под старыми. Старые кнопки "
+    "не изменятся.\n\n"
+    "Одна строка = одна кнопка: название - ссылка\n"
+    "Пример: Отзывы - avito.ru/brands/rmservice - style:blue\n\n"
+    "Цвет необязателен (style:green, style:blue, style:red). Знак | ставит кнопки "
+    "в один ряд. Ничего не добавлять: нажмите «Не добавлять»."
+)
+ADD_KB = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("⏭ Не добавлять", callback_data="post:nobtn")],
+        [InlineKeyboardButton("🗑 Отмена", callback_data="post:cancel")],
+    ]
+)
+DELETE_TEXT = (
+    "➖ Нажмите на кнопку, которую нужно убрать. Остальные не изменятся. "
+    "Когда закончите, нажмите «Готово»."
+)
+
+# цвета кнопок (Bot API 9.4): primary - синяя, success - зелёная, danger - красная
+STYLE_WORDS = {
+    "green": "success", "success": "success", "зелёный": "success",
+    "зеленый": "success", "зелёная": "success", "зеленая": "success",
+    "blue": "primary", "primary": "primary", "синий": "primary", "синяя": "primary",
+    "red": "danger", "danger": "danger", "красный": "danger", "красная": "danger",
+}
+STYLE_ICON = {"success": "🟢", "primary": "🔵", "danger": "🔴"}
+STYLE_RE = re.compile(
+    r"^(?P<rest>.*?)\s*[-–—]?\s*style\s*[:=]\s*(?P<word>\S+?)\s*$", re.IGNORECASE
+)
+
+
+def buttons_prompt(post):
+    # что показать, когда ждём кнопки: добавление к старым или замена всех
+    if post.get("append"):
+        return ADD_BUTTONS_TEXT, ADD_KB
+    return POST_BUTTONS_TEXT, POST_BUTTONS_KB
+
+
+def buttons_summary(rows):
+    if not rows:
+        return "Кнопок нет."
+    lines = []
+    for row in rows:
+        parts = []
+        for b in row:
+            t, _u, s = unpack(b)
+            parts.append(f"{STYLE_ICON.get(s, '▫️')} {t}")
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
+
+def remove_button(rows, n):
+    # убирает кнопку с порядковым номером n (по всем рядам), пустые ряды выбрасывает
+    out, i = [], 0
+    for row in rows:
+        keep = []
+        for b in row:
+            if i != n:
+                keep.append(b)
+            i += 1
+        if keep:
+            out.append(keep)
+    return out
+
+
+def delete_kb(rows):
+    kb, i = [], 0
+    for row in rows:
+        for b in row:
+            kb.append([InlineKeyboardButton(f"❌ {unpack(b)[0][:30]}", callback_data=f"post:rm:{i}")])
+            i += 1
+    kb.append([InlineKeyboardButton("✅ Готово", callback_data="post:rmdone")])
+    kb.append([InlineKeyboardButton("🗑 Отмена", callback_data="post:cancel")])
+    return InlineKeyboardMarkup(kb)
+
+
+def buttons_from_markup(markup):
+    # Кнопки-ссылки из пересланного поста: [[(название, ссылка, цвет), ...], ...].
+    # Кнопки не со ссылкой (реакции, счётчики) бот перенести не может, их пропускаем.
+    rows, skipped = [], 0
+    for row in getattr(markup, "inline_keyboard", None) or []:
+        out = []
+        for b in row:
+            url = getattr(b, "url", None)
+            if not url:
+                skipped += 1
+                continue
+            style = getattr(b, "style", None) or (getattr(b, "api_kwargs", None) or {}).get("style")
+            out.append((b.text, url, style if style in STYLE_ICON else None))
+        if out:
+            rows.append(out)
+    return rows, skipped
 
 
 def button_url(u: str) -> str:
@@ -1283,7 +1386,7 @@ def button_url(u: str) -> str:
 
 
 def parse_buttons(text: str):
-    # Возвращает ряды кнопок [[(название, ссылка), ...], ...] и список непонятых строк.
+    # Возвращает ряды кнопок [[(название, ссылка, цвет), ...], ...] и список непонятых строк.
     rows, bad = [], []
     for line in text.split("\n"):
         line = clean(line)
@@ -1291,11 +1394,19 @@ def parse_buttons(text: str):
             continue
         row, ok = [], True
         for part in line.split("|"):
-            m = BUTTON_RE.match(part.strip())
+            part, style = part.strip(), None
+            sm = STYLE_RE.match(part)
+            if sm:
+                style = STYLE_WORDS.get(sm.group("word").lower())
+                if not style:
+                    ok = False
+                    break
+                part = sm.group("rest").strip()
+            m = BUTTON_RE.match(part)
             if not m:
                 ok = False
                 break
-            row.append((m.group("name").strip(), button_url(m.group("url"))))
+            row.append((m.group("name").strip(), button_url(m.group("url")), style))
         if ok and row:
             rows.append(row)
         else:
@@ -1303,11 +1414,25 @@ def parse_buttons(text: str):
     return rows, bad
 
 
+def unpack(b):
+    # кнопка хранится как (название, ссылка) или (название, ссылка, цвет)
+    return b[0], b[1], (b[2] if len(b) > 2 else None)
+
+
+def make_button(t, u, s=None):
+    if not s:
+        return InlineKeyboardButton(t, url=u)
+    try:
+        return InlineKeyboardButton(t, url=u, style=s)  # python-telegram-bot 22.7+
+    except TypeError:  # старая версия библиотеки: передаём поле напрямую
+        return InlineKeyboardButton(t, url=u, api_kwargs={"style": s})
+
+
 def post_kb(rows):
     if not rows:
         return None
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(t, url=u) for t, u in row] for row in rows]
+        [[make_button(*unpack(b)) for b in row] for row in rows]
     )
 
 
@@ -1321,8 +1446,7 @@ def post_title(plain, media):
 # ----- что бот помнит о постах (state.json) -----
 
 def remember_post(mid, title=None, rows=None):
-    # Запоминаем пост и его кнопки: бот не может прочитать кнопки из канала,
-    # поэтому при правке текста берёт те, что сам поставил.
+    # Запоминаем пост и его кнопки (с цветами): при правке текста бот ставит их обратно.
     try:
         state = load_state()
         old = next((r for r in state["recent"] if r["id"] == mid), None)
@@ -1331,7 +1455,7 @@ def remember_post(mid, title=None, rows=None):
         state["recent"].insert(0, {"id": mid, "title": title})
         state["recent"] = state["recent"][:10]
         if rows:
-            state["post_buttons"][str(mid)] = [[[t, u] for t, u in row] for row in rows]
+            state["post_buttons"][str(mid)] = [[list(unpack(b)) for b in row] for row in rows]
         else:
             state["post_buttons"].pop(str(mid), None)
         save_state(state)
@@ -1398,7 +1522,7 @@ def target_from_text(text):
     return mid
 
 
-async def select_target(bot, chat_id, post, mid):
+async def select_target(bot, chat_id, post, mid, rows=None):
     try:
         await bot.copy_message(chat_id, CHANNEL_ID, mid)  # показываем, какой это пост
     except Exception as e:
@@ -1410,12 +1534,22 @@ async def select_target(bot, chat_id, post, mid):
             reply_markup=pick_kb(load_state()),
         )
         return
-    known = load_state()["post_buttons"].get(str(mid))
-    post.update(target=mid, step="menu", buttons=known or [], buttons_known=bool(known),
-                text=None, plain="", media=None)
+    if rows:  # кнопки прочитаны из пересланного поста: это самые свежие данные
+        remember_post(mid, None, rows)
+        known, origin = rows, "прочитала из пересланного поста"
+    else:
+        known = load_state()["post_buttons"].get(str(mid))
+        origin = "запомнила раньше" if known else None
+    post.update(target=mid, step="menu", buttons=known or [], base_buttons=list(known or []),
+                buttons_known=bool(known), append=False, text=None, plain="", media=None)
+    if origin:
+        info = f"Кнопки под постом ({origin}):\n{buttons_summary(known)}"
+    else:
+        info = ("Кнопок бот не видит. Если они под постом есть, перешлите мне этот пост "
+                "из канала: так бот их прочитает и ничего не потеряет.")
     await bot.send_message(
         chat_id,
-        f"👆 Это пост #{mid}: {msg_link(mid)}\nЧто с ним сделать?",
+        f"👆 Это пост #{mid}: {msg_link(mid)}\n\n{info}\n\nЧто сделать?",
         reply_markup=EDIT_MENU_KB,
         link_preview_options=NO_PREVIEW,
     )
@@ -1630,6 +1764,9 @@ async def on_post_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "pick":
         mid = target_from_forward(msg)
+        rows = None
+        if isinstance(mid, int):  # пост переслан: читаем его кнопки
+            rows, _skipped = buttons_from_markup(getattr(msg, "reply_markup", None))
         if mid is None and msg.text:
             mid = target_from_text(msg.text)
         if mid == "other":
@@ -1644,12 +1781,19 @@ async def on_post_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=pick_kb(load_state()),
             )
         else:
-            await select_target(context.bot, msg.chat_id, post, mid)
+            await select_target(context.bot, msg.chat_id, post, mid, rows)
         return
 
     if step == "menu":
         await msg.reply_text(
             "Выберите, что сделать с постом, кнопками под ним.", reply_markup=EDIT_MENU_KB
+        )
+        return
+
+    if step == "delete":
+        await msg.reply_text(
+            "Нажимайте на кнопки под сообщением выше, затем «Готово».",
+            reply_markup=delete_kb(post["buttons"]),
         )
         return
 
@@ -1708,19 +1852,21 @@ async def on_post_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not msg.text:
             await msg.reply_text(
                 "Нужен текст с кнопками: название - ссылка (по одной на строку). "
-                "Или нажмите «Без кнопок».",
-                reply_markup=POST_BUTTONS_KB,
+                "Или нажмите кнопку под сообщением выше.",
+                reply_markup=buttons_prompt(post)[1],
             )
             return
         rows, bad = parse_buttons(msg.text)
         if bad or not rows:
             await msg.reply_text(
                 "Не поняла эти строки:\n" + "\n".join(bad[:5] or [msg.text[:100]])
-                + "\n\nНужно так: название - ссылка. Пришлите кнопки ещё раз.",
-                reply_markup=POST_BUTTONS_KB,
+                + "\n\nНужно так: название - ссылка (можно добавить - style:green, blue или red). "
+                "Пришлите кнопки ещё раз.",
+                reply_markup=buttons_prompt(post)[1],
             )
             return
-        post["buttons"], post["buttons_known"] = rows, True
+        base = list(post.get("base_buttons") or []) if post.get("append") else []
+        post["buttons"], post["buttons_known"] = base + rows, True
         post.pop("editing", None)
         post["step"] = "ready"
         await send_preview(context.bot, msg.chat_id, post)
@@ -1776,8 +1922,44 @@ async def on_post_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ebtn":
         if post["step"] != "menu":
             return
-        post.update(step="buttons", mode="buttons", text=None)
+        post.update(step="buttons", mode="buttons", text=None, append=False)
         await q.edit_message_text(POST_BUTTONS_TEXT, reply_markup=POST_BUTTONS_KB)
+
+    elif action == "eadd":
+        if post["step"] != "menu":
+            return
+        post.update(step="buttons", mode="buttons", text=None, append=True)
+        await q.edit_message_text(ADD_BUTTONS_TEXT, reply_markup=ADD_KB)
+
+    elif action == "edel":
+        if post["step"] != "menu":
+            return
+        if not post["buttons"]:
+            await q.edit_message_text(
+                "Кнопок, которые бот знает, у этого поста нет. Если они есть, перешлите "
+                "мне этот пост из канала.",
+                reply_markup=EDIT_MENU_KB,
+            )
+            return
+        post.update(step="delete", mode="buttons", text=None, append=False)
+        await q.edit_message_text(DELETE_TEXT, reply_markup=delete_kb(post["buttons"]))
+
+    elif action.startswith("rm:"):
+        if post["step"] != "delete":
+            return
+        post["buttons"] = remove_button(post["buttons"], int(action[3:]))
+        post["buttons_known"] = True
+        await q.edit_message_text(
+            DELETE_TEXT + ("" if post["buttons"] else "\n\nКнопок не осталось."),
+            reply_markup=delete_kb(post["buttons"]),
+        )
+
+    elif action == "rmdone":
+        if post["step"] != "delete":
+            return
+        post["step"] = "ready"
+        await q.edit_message_text("Готово, смотрим, что получилось.")
+        await send_preview(context.bot, chat_id, post)
 
     elif action == "erm":
         if post["step"] != "menu":
@@ -1800,10 +1982,16 @@ async def on_post_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "nobtn":
         if post["step"] != "buttons":
             return
-        post.update(buttons=[], buttons_known=True)
+        if post.get("append"):  # «Не добавлять»: старые кнопки остаются как были
+            post["buttons"] = list(post.get("base_buttons") or [])
+            note = "Ничего не добавляю."
+        else:
+            post["buttons"] = []
+            note = "Без кнопок."
+        post["buttons_known"] = True
         post.pop("editing", None)
         post["step"] = "ready"
-        await q.edit_message_text("Без кнопок.")
+        await q.edit_message_text(note)
         await send_preview(context.bot, chat_id, post)
 
     elif action == "txt":
@@ -1818,7 +2006,10 @@ async def on_post_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if post["step"] != "ready":
             return
         post["step"], post["editing"] = "buttons", True
-        await q.edit_message_text(POST_BUTTONS_TEXT, reply_markup=POST_BUTTONS_KB)
+        if post["mode"] != "buttons":
+            post["append"] = False
+        text, kb = buttons_prompt(post)
+        await q.edit_message_text(text, reply_markup=kb)
 
     elif action in ("pub", "pubs"):
         if post["step"] != "ready":
