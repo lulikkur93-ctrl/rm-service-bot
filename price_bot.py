@@ -77,7 +77,7 @@ MIN_PRICE = int(os.getenv("MIN_PRICE_FOR_MARKUP", "30000"))
 WAIT_SECONDS = int(os.getenv("WAIT_SECONDS", "60"))
 MENU_TEXT = os.getenv("MENU_TEXT", "📱 Выберите модель iPhone или нужный раздел:")
 STATE_FILE = os.getenv("STATE_PATH", "state.json")
-VERSION = "19"
+VERSION = "19.1 (повторы при сбоях сети)"
 MENU_ENABLED = os.getenv("MENU_ENABLED", "0") == "1"  # кнопки в канале: по умолчанию выключены
 LIMIT = 3800  # лимит Telegram 4096, берём с запасом (теги тоже считаем)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
