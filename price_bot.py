@@ -38,6 +38,7 @@
   PRICE_MESSAGE_IDS      id постов с прайсом через запятую (бот подскажет сам)
   MENU_MESSAGE_ID        id поста-меню (бот подскажет сам)
 """
+import asyncio
 import html
 import json
 import logging
@@ -54,7 +55,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -80,6 +81,30 @@ VERSION = "19"
 MENU_ENABLED = os.getenv("MENU_ENABLED", "0") == "1"  # кнопки в канале: по умолчанию выключены
 LIMIT = 3800  # лимит Telegram 4096, берём с запасом (теги тоже считаем)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
+async def retry_call(func, *args, tries=5, **kwargs):
+    """Повторяет вызов Telegram, если оборвалась сеть (TimedOut, httpx.ReadError)
+    или Telegram просит подождать. Использовать ТОЛЬКО для правок постов:
+    повтор правки безопасен, а повтор отправки нового поста мог бы дать дубль."""
+    for attempt in range(tries):
+        try:
+            return await func(*args, **kwargs)
+        except RetryAfter as e:
+            if attempt == tries - 1:
+                raise
+            wait = e.retry_after
+            wait = wait.total_seconds() if hasattr(wait, "total_seconds") else wait
+            logging.warning("Telegram просит подождать %s сек.", wait)
+            await asyncio.sleep(wait + 1)
+        except NetworkError as e:  # TimedOut тоже сюда
+            if attempt == tries - 1:
+                raise
+            logging.warning(
+                "Сбой сети (%s: %s), повтор %s из %s",
+                type(e).__name__, e, attempt + 2, tries,
+            )
+            await asyncio.sleep(2 * (attempt + 1))
 
 
 def norm_url(value: str) -> str:
@@ -1077,7 +1102,22 @@ async def do_publish(bot, bd, chat_id, mapping):
     bd.pop("route", None)
     if not draft:
         return
-    res = await publish_routed(bot, draft, mapping)
+    try:
+        res = await publish_routed(bot, draft, mapping)
+    except Exception as e:
+        # Сеть не выдержала даже после повторов. Черновик возвращаем, чтобы не
+        # пришлось присылать прайс заново: нажмите «Опубликовать» ещё раз.
+        # Уже заменённые посты при повторе дадут «not modified» и считаются готовыми.
+        logging.exception("Публикация прервана")
+        bd["draft"] = draft
+        await bot.send_message(
+            chat_id,
+            f"⚠️ Публикация прервалась ({type(e).__name__}). Часть постов в канале "
+            "могла уже обновиться. Черновик сохранён: нажмите «Опубликовать» ещё раз "
+            "и выберите те же посты, готовые бот пропустит сам.",
+            reply_markup=DRAFT_KB,
+        )
+        return
 
     lines = []
     for j, (mid, kind) in sorted(res["actual"].items()):
@@ -1127,10 +1167,13 @@ async def publish_routed(bot, draft, mapping):
         if target == "skip":
             continue
         meta = {"title": draft["post_titles"][j], "labels": draft["post_labels"][j]}
+        if actual:
+            await asyncio.sleep(1.5)  # пауза между постами, чтобы Telegram не тормозил
         if target != "new":
             mid = int(target)
             try:
-                await bot.edit_message_text(
+                await retry_call(
+                    bot.edit_message_text,
                     text,
                     chat_id=CHANNEL_ID,
                     message_id=mid,
@@ -1138,6 +1181,8 @@ async def publish_routed(bot, draft, mapping):
                 )
                 actual[j] = (mid, "edit")
                 posts_meta[str(mid)] = meta
+                state.update(ids=ids, posts=posts_meta)
+                save_state(state)  # сохраняем после каждого поста
                 continue
             except BadRequest as e:
                 if "not modified" in str(e).lower():
@@ -1152,6 +1197,8 @@ async def publish_routed(bot, draft, mapping):
         ids.append(sent.message_id)
         posts_meta[str(sent.message_id)] = meta
         actual[j] = (sent.message_id, "new")
+        state.update(ids=ids, posts=posts_meta)
+        save_state(state)
 
     # меню: добавляем/обновляем кнопки для опубликованных моделей, старые остаются
     menu_list = [
@@ -1176,8 +1223,9 @@ async def publish_routed(bot, draft, mapping):
     if MENU_ENABLED:
         kb = build_menu_kb(menu_list)
         try:
-            await bot.edit_message_text(
-                MENU_TEXT, chat_id=CHANNEL_ID, message_id=menu_id, reply_markup=kb
+            await retry_call(
+                bot.edit_message_text,
+                MENU_TEXT, chat_id=CHANNEL_ID, message_id=menu_id, reply_markup=kb,
             )
         except BadRequest as e:
             if "not modified" not in str(e).lower():
@@ -1633,14 +1681,16 @@ async def apply_edit(bot, post):
     kb = post_kb(rows)
     if post["mode"] == "text":
         try:
-            await bot.edit_message_text(
+            await retry_call(
+                bot.edit_message_text,
                 post["text"], chat_id=CHANNEL_ID, message_id=mid,
                 parse_mode=ParseMode.HTML, reply_markup=kb,
             )
         except BadRequest as e:
             low = str(e).lower()
             if "no text in the message" in low:  # у поста есть фото: правим подпись
-                await bot.edit_message_caption(
+                await retry_call(
+                    bot.edit_message_caption,
                     chat_id=CHANNEL_ID, message_id=mid,
                     caption=post["text"], parse_mode=ParseMode.HTML, reply_markup=kb,
                 )
@@ -1649,7 +1699,8 @@ async def apply_edit(bot, post):
         remember_post(mid, post_title(post.get("plain"), None), rows)
     else:
         try:
-            await bot.edit_message_reply_markup(
+            await retry_call(
+                bot.edit_message_reply_markup,
                 chat_id=CHANNEL_ID, message_id=mid,
                 reply_markup=kb or InlineKeyboardMarkup([]),
             )
@@ -2079,7 +2130,16 @@ async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(on_startup)
+        .connect_timeout(30)  # по умолчанию всего 5 секунд
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new))
